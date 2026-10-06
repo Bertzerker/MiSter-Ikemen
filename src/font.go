@@ -617,7 +617,7 @@ func (f *Fnt) drawChar(
 	// Check if glyph has data: either an atlas entry, a pending texture, or an existing texture.
 	bankKey := int32(spr.Group) << 16
 	_, hasUV := f.atlasUVs[[2]int32{bankKey, int32(c)}]
-	if !hasUV && spr.Tex == nil && spr.pendingDepth == 0 {
+	if !hasUV && spr.Tex == nil && spr.pendingDepth == 0 && spr.lazyTexture == nil {
 		return 0
 	}
 

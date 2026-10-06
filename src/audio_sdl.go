@@ -20,6 +20,9 @@ type AudioSink interface {
 }
 
 var speaker AudioSink
+var nativeAudioFactory func() AudioSink
+var nativeAudioShutdown func()
+var nativeAudioDisabled bool
 
 type SDLSpeaker struct {
 	dev        sdl.AudioDeviceID

@@ -3,12 +3,182 @@
 package main
 
 import (
+	"bytes"
 	"math"
 	"math/rand"
 	"testing"
 
 	mgl "github.com/go-gl/mathgl/mgl32"
 )
+
+// Match the former double-precision boundary calculation at half-pixels,
+// negative positions, large values and random float32 bit patterns.
+func TestSWPixelRangeExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(821))
+	check := func(lo, hi float32) {
+		a := int(math.Ceil(float64(lo - 0.5)))
+		b := int(math.Ceil(float64(hi-0.5))) - 1
+		if b < a {
+			b = a - 1
+		}
+		x, y := pixelRange(lo, hi)
+		if x != a || y != b {
+			t.Fatalf("[%v,%v): [%d,%d] != [%d,%d]", lo, hi, x, y, a, b)
+		}
+	}
+	for i := -1024; i <= 1024; i++ {
+		v := float32(i) + 0.5
+		check(math.Nextafter32(v, float32(math.Inf(-1))), v)
+		check(v, math.Nextafter32(v, float32(math.Inf(1))))
+	}
+	for i := 0; i < 12000; i++ {
+		check(math.Float32frombits(rng.Uint32()), math.Float32frombits(rng.Uint32()))
+	}
+}
+
+// Compare the cheaper vertex path with the original matrix-vector product.
+func TestSWWindowVertexExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(812))
+	for sample := 0; sample < 4000; sample++ {
+		var m mgl.Mat4
+		for i := range m {
+			m[i] = rng.Float32()*4 - 2
+		}
+		if sample%3 != 0 {
+			m[3], m[7], m[11], m[15] = 0, 0, 0, float32(sample%3-1)
+		}
+		x, y := rng.Float32()*4096-2048, rng.Float32()*4096-2048
+		p := m.Mul4x1(mgl.Vec4{x, y, 0, 1})
+		wx, wy := p.X(), p.Y()
+		if p.W() != 0 {
+			wx /= p.W()
+			wy /= p.W()
+		}
+		want := swVertex{(wx + 1) * 160, (wy + 1) * 120, 0.25, 0.75}
+		got := swWindowVertex(&m, x, y, 0.25, 0.75, 160, 120)
+		if got != want {
+			t.Fatalf("sample %d got %+v want %+v", sample, got, want)
+		}
+	}
+}
+
+// Compare cached immediate draws with a fresh transform/palette computation.
+// Repeated tiles, camera changes, palette edits and PalFX must all stay exact.
+func TestSWImmediateCacheInvalidation(t *testing.T) {
+	ref, cached := newSWTestRenderer(64, 48), newSWTestRenderer(64, 48)
+	tex := &swTexture{width: 2, height: 2, depth: 8, serial: 700, data: []byte{0, 1, 1, 0}}
+	pal := &swTexture{width: 256, height: 1, depth: 32, serial: 701, data: make([]byte, 1024)}
+	pal.data[0], pal.data[3], pal.data[6], pal.data[7] = 255, 255, 255, 255
+	proj := mgl.Ortho(0, 64, 0, 48, -65535, 65535)
+	mv := mgl.Translate3D(0, 48, 0)
+	for step := 0; step < 16; step++ {
+		if step == 3 {
+			mv = mgl.Translate3D(7.25, 41.5, 0)
+		}
+		if step == 5 {
+			proj = mgl.Ortho(-8, 64, -4, 48, -65535, 65535)
+		}
+		if step == 7 {
+			pal.data[0], pal.data[1] = 0, 255
+			pal.dataVersion++
+		}
+		if step == 9 {
+			mv = mgl.Translate3D(35, 36, 0).Mul4(mgl.Scale3D(-1, 1, 1))
+		}
+		if step == 13 {
+			mv = mv.Mul4(mgl.HomogRotate3DZ(0.25))
+		}
+		for _, r := range []*Renderer_SW{ref, cached} {
+			r.SetUniformMatrix("projection", proj[:])
+			r.SetUniformMatrix("modelview", mv[:])
+			r.SetUniformI("mask", -1)
+			r.SetUniformFv("mult", []float32{1, 1, 1})
+			r.SetUniformF("alpha", 1)
+			if step >= 11 {
+				r.SetUniformF("gray", 0.5)
+			}
+			r.EnableBlending(BlendAdd, BlendOne, BlendOneMinusSrcAlpha)
+			r.SetTexture("tex", tex)
+			r.SetTexture("pal", pal)
+			for tile := 0; tile < 3; tile++ {
+				x := float32(tile * 11)
+				r.SetVertexData(x, -24, 0, 1, x, 0, 0, 0, x+16, -24, 1, 1, x+16, 0, 1, 0)
+				if r == ref {
+					r.curTransformValid = false
+					r.lastPalTable = nil
+					r.palTableCache = nil
+				}
+				r.RenderQuad()
+			}
+		}
+		if !bytes.Equal(ref.pix, cached.pix) {
+			t.Fatalf("cached draw differs at step %d", step)
+		}
+	}
+}
+
+// Self-check for the software rasterizer: constructs synthetic quads and
+func TestSWTiledSpriteState(t *testing.T) {
+	oldGfx, oldRect := gfx, sys.scrrect
+	defer func() { gfx, sys.scrrect = oldGfx, oldRect }()
+	sys.scrrect = [4]int32{0, 0, 64, 48}
+	tex := &swTexture{width: 4, height: 4, depth: 8, serial: 811, data: make([]byte, 16)}
+	pal := &swTexture{width: 256, height: 1, depth: 32, serial: 812, data: make([]byte, 1024)}
+	rgba := &swTexture{width: 4, height: 4, depth: 32, serial: 813, data: make([]byte, 64)}
+	for i := range tex.data {
+		tex.data[i] = byte(i * 13)
+	}
+	for i := range pal.data {
+		pal.data[i] = byte(i*37 + i/4)
+	}
+	copy(rgba.data, pal.data)
+	for sample := 0; sample < 24; sample++ {
+		ref, batch := newSWTestRenderer(64, 48), newSWTestRenderer(64, 48)
+		proj := mgl.Ortho(0, 64, 0, 48, -65535, 65535)
+		mv := mgl.Translate3D(0, 48, 0)
+		if sample%3 == 1 {
+			mv = mv.Mul4(mgl.HomogRotate3DZ(0.14))
+		}
+		if sample%3 == 2 {
+			mv = mv.Mul4(mgl.Translate3D(64, 0, 0)).Mul4(mgl.Scale3D(-1, 1, 1))
+		}
+		rp := RenderParams{size: [2]uint16{8, 8}, x: -3.25, y: -2.75, xts: 1, xbs: 1, ys: 1, vs: 1, xas: 1, yas: 1,
+			tile: Tiling{xflag: 1, yflag: 1}, UV: [4]float32{0.1, 0.2, 0.9, 0.85}}
+		if sample%4 == 0 {
+			rp.xbs = 1.3
+			rp.tile = Tiling{xflag: 3, yflag: 3}
+		}
+		pal.data[1] = byte(sample * 9)
+		pal.dataVersion++
+		for _, r := range []*Renderer_SW{ref, batch} {
+			r.SetUniformMatrix("projection", proj[:])
+			r.SetUniformI("mask", sample%2-1)
+			r.SetUniformI("isTrapez", int(Btoi(rp.xbs != rp.xts)))
+			r.SetUniformFv("mult", []float32{1, 0.7, 1})
+			r.SetUniformF("alpha", 0.75)
+			r.SetUniformF("gray", float32(sample%3)*0.25)
+			r.EnableBlending(BlendAdd, BlendOne, BlendOneMinusSrcAlpha)
+			r.EnableScissor(3, 2, 56, 41)
+			r.SetTexture("tex", tex)
+			r.SetTexture("pal", pal)
+			if sample%2 == 1 {
+				r.SetTexture("tex", rgba)
+			}
+			gfx = r
+			if r == ref {
+				renderSpriteQuad(mv, rp, drawQuadsUV)
+			} else if !r.renderSpriteQuads(mv, rp) {
+				t.Fatal("unexpected fallback")
+			}
+		}
+		if !bytes.Equal(ref.pix, batch.pix) {
+			t.Fatalf("tile state mismatch in case %d", sample)
+		}
+		if bytes.Equal(batch.pix, make([]byte, len(batch.pix))) {
+			t.Fatalf("empty test case %d", sample)
+		}
+	}
+}
 
 // Self-check for the software rasterizer: constructs synthetic quads and
 // verifies the framebuffer pixels. Run with `go test ./src -run TestSW`.

@@ -76,13 +76,14 @@ func ResampleRatio(quality int, ratio float64, s Streamer) *Resampler {
 // changing of the resampling ratio, which can be useful for dynamically changing the speed of
 // streaming.
 type Resampler struct {
-	s          Streamer     // the original streamer
-	ratio      float64      // old sample rate / new sample rate
-	buf1, buf2 [][2]float64 // buf1 contains previous buf2, new data goes into buf2, buf1 is because interpolation might require old samples
-	pts        []point      // pts is for points used for interpolation
-	off        int          // off is the position of the start of buf2 in the original data
-	pos        float64      // pos is the current position in the resampled data
-	end        int          // end is the position after the last sample in the original data
+	fastPolynomial bool
+	s              Streamer     // the original streamer
+	ratio          float64      // old sample rate / new sample rate
+	buf1, buf2     [][2]float64 // buf1 contains previous buf2, new data goes into buf2, buf1 is because interpolation might require old samples
+	pts            []point      // pts is for points used for interpolation
+	off            int          // off is the position of the start of buf2 in the original data
+	pos            float64      // pos is the current position in the resampled data
+	end            int          // end is the position after the last sample in the original data
 }
 
 // Stream streams the original audio resampled according to the current ratio.
@@ -114,6 +115,29 @@ func (r *Resampler) Stream(samples [][2]float64) (n int, ok bool) {
 			return n, n > 0
 		}
 
+		// At an integer position and unit ratio, interpolation reproduces the
+		// source samples. Copy a run while retaining the original lookahead
+		// boundary, so a later SetRatio still sees the same buffered history.
+		if r.fastPolynomial && r.ratio == 1 && wantPos == float64(int(wantPos)) {
+			position := int(wantPos)
+			buf, index := r.buf2, position-r.off
+			if index < 0 {
+				buf, index = r.buf1, position-(r.off-resamplerSingleBufferSize)
+			}
+			count := len(samples)
+			for _, limit := range [3]int{len(buf) - index, r.end - position,
+				r.off + resamplerSingleBufferSize - windowEnd + 1} {
+				if limit < count {
+					count = limit
+				}
+			}
+			copy(samples[:count], buf[index:index+count])
+			samples = samples[count:]
+			n += count
+			r.pos += float64(count)
+			continue
+		}
+
 		// Adjust the window to be within the available buffers.
 		//windowStart = max(windowStart, 0)
 		if windowStart < 0 {
@@ -124,33 +148,55 @@ func (r *Resampler) Stream(samples [][2]float64) (n int, ok bool) {
 			windowEnd = r.end
 		}
 
-		// For each channel...
-		for c := range samples[0] {
-			// Get the points.
-			numPts := windowEnd - windowStart
-			pts := r.pts[:numPts]
-			for i := range pts {
-				x := windowStart + i
-				var y float64
-				if x < r.off {
-					// Sample is in buf1.
-					offBuf1 := r.off - resamplerSingleBufferSize
-					y = r.buf1[x-offBuf1][c]
-				} else {
-					// Sample is in buf2.
-					y = r.buf2[x-r.off][c]
-				}
-				pts[i] = point{
-					X: float64(x),
-					Y: y,
+		// Both channels use the same interpolation positions and weights.
+		// Preserve each channel's original summation order, but calculate the
+		// expensive polynomial products/divisions only once per stereo sample.
+		var output [2]float64
+		// Six equally spaced points (quality 3): form prefix/suffix products
+		// once, instead of rebuilding 6 products of 5 divisions. Boundary
+		// windows retain the general algorithm below.
+		var weights [6]float64
+		fast := len(r.pts) == 2 && windowEnd-windowStart == 2
+		if fast {
+			// Linear interpolation needs just two weights, with denominators
+			// -1 and +1. Preserve the original arithmetic and buffer handling.
+			weights[0] = -(wantPos - float64(windowStart+1))
+			weights[1] = wantPos - float64(windowStart)
+		} else if r.fastPolynomial && len(r.pts) == 6 && windowEnd-windowStart == 6 {
+			fast = true
+			var prefix [7]float64
+			prefix[0] = 1
+			for k := 0; k < 6; k++ {
+				prefix[k+1] = prefix[k] * (wantPos - float64(windowStart+k))
+			}
+			suffix := 1.0
+			denominator := [6]float64{-120, 24, -12, 12, -24, 120}
+			for k := 5; k >= 0; k-- {
+				weights[k] = prefix[k] * suffix / denominator[k]
+				suffix *= wantPos - float64(windowStart+k)
+			}
+		}
+		for j := windowStart; j < windowEnd; j++ {
+			weight := 1.0
+			if fast {
+				weight = weights[j-windowStart]
+			} else {
+				for m := windowStart; m < windowEnd; m++ {
+					if j != m {
+						weight *= (wantPos - float64(m)) / (float64(j) - float64(m))
+					}
 				}
 			}
-
-			// Calculate the resampled sample using polynomial interpolation from the
-			// quality*2 closest samples.
-			samples[0][c] = lagrange(pts, wantPos)
+			var value [2]float64
+			if j < r.off {
+				value = r.buf1[j-(r.off-resamplerSingleBufferSize)]
+			} else {
+				value = r.buf2[j-r.off]
+			}
+			output[0] += value[0] * weight
+			output[1] += value[1] * weight
 		}
-
+		samples[0] = output
 		samples = samples[1:]
 		n++
 		r.pos++
@@ -168,6 +214,12 @@ func (r *Resampler) Err() error {
 func (r *Resampler) Ratio() float64 {
 	return r.ratio
 }
+
+// SetFastPolynomial enables a factored quality-3 polynomial and unit-ratio
+// copying for finite PCM. It preserves the interpolation curve but changes
+// floating-point rounding by a few ulps and may preserve negative zero.
+// Configure before playback, or under the same lock as SetRatio.
+func (r *Resampler) SetFastPolynomial(enabled bool) { r.fastPolynomial = enabled }
 
 // SetRatio sets the resampling ratio. This does not cause any glitches in the stream.
 func (r *Resampler) SetRatio(ratio float64) {

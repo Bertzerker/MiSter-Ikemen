@@ -1,4 +1,4 @@
-//go:build mugen
+//go:build mugen || minimal
 
 package main
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -242,6 +243,10 @@ func memMonitorStart() {
 //
 // Only built with -tags debug; release builds stub this out entirely.
 func startProfiler() {
+	if os.Getenv("IKEMEN_WAIT_PROFILE") == "1" {
+		runtime.SetMutexProfileFraction(1)
+		runtime.SetBlockProfileRate(1000000)
+	}
 	addr := fmt.Sprintf("localhost:%d", ProfilePort)
 	LogMessage("[PProf] heap profile server on http://%s/debug/pprof/heap", addr)
 	LogMessage("[PProf] run: go tool pprof http://%s/debug/pprof/heap", addr)
@@ -285,11 +290,11 @@ var (
 )
 
 func perfRenderBegin() time.Time { return time.Now() }
-func perfRenderEnd(t time.Time)  { renderTimeAccum += time.Since(t) }
+func perfRenderEnd(t time.Time)  { renderTimeAccum += time.Since(t); perfStallEnd(t, "draw") }
 func perfFrameRendered()         { renderFrameCount++ }
 
 func perfActionBegin() time.Time { return time.Now() }
-func perfActionEnd(t time.Time)  { actionTimeAccum += time.Since(t) }
+func perfActionEnd(t time.Time)  { actionTimeAccum += time.Since(t); perfStallEnd(t, "action") }
 
 func perfCharBegin() time.Time { return time.Now() }
 func perfCharEnd(t time.Time)  { actionCharAccum += time.Since(t) }
@@ -316,11 +321,11 @@ func perfCollBegin() time.Time { return time.Now() }
 func perfCollEnd(t time.Time)  { actionCollAccum += time.Since(t) }
 
 func perfLogicBegin() time.Time { return time.Now() }
-func perfLogicEnd(t time.Time)  { logicTimeAccum += time.Since(t) }
+func perfLogicEnd(t time.Time)  { logicTimeAccum += time.Since(t); perfStallEnd(t, "update") }
 func perfLoopIter()             { loopIterCount++ }
 
 func perfGpuBegin() time.Time { return time.Now() }
-func perfGpuEnd(t time.Time)  { gpuTimeAccum += time.Since(t) }
+func perfGpuEnd(t time.Time)  { gpuTimeAccum += time.Since(t); perfStallEnd(t, "present") }
 
 func perfFlushBegin() time.Time { return time.Now() }
 func perfFlushEnd(t time.Time)  { flushTimeAccum += time.Since(t) }
@@ -339,6 +344,14 @@ func perfFrameLog() {
 	if !sys.cfg.Video.PerfLog || renderFrameCount < 60 {
 		return
 	}
+	LogMessage("[FRAME] draw=%.1fms present=%.1fms action=%.1fms update=%.1fms renders=%d ticks=%d",
+		float64(renderTimeAccum)/float64(renderFrameCount)/float64(time.Millisecond),
+		float64(gpuTimeAccum)/float64(renderFrameCount)/float64(time.Millisecond),
+		float64(actionTimeAccum)/float64(Max(1, loopIterCount))/float64(time.Millisecond),
+		float64(logicTimeAccum)/float64(Max(1, loopIterCount))/float64(time.Millisecond),
+		renderFrameCount, loopIterCount)
+	renderTimeAccum, gpuTimeAccum, actionTimeAccum, logicTimeAccum = 0, 0, 0, 0
+	renderFrameCount, loopIterCount = 0, 0
 	// render/gpu are per rendered frame; action/logic are per loop iteration
 	// (update runs every iteration, skipped renders still tick logic).
 	// LogMessage("[FRAME] render=%.1fms action=%.1fms (chars=%.2f[cmd=%.2f prep=%.2f run=%.2f fin=%.2f] upd=%.2f fs=%.2f coll=%.2f) logic=%.1fms gpu=%.1fms flush=%.1fms sprites=%d batches=%d (flat=%d blend=%d rgba=%d trap=%d mask=%d scis=%d slots=%d) renders=%d/%d",

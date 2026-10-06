@@ -679,16 +679,18 @@ type Sprite struct {
 	PalTex   Texture
 	// Deferred texture creation: pixel data stored during SFF loading and
 	// uploaded to the GPU lazily when the sprite is first rendered.
-	pendingData   []byte // raw pixel data (nil if no pending texture)
-	pendingDepth  int32  // bit depth: 0 = none, 8 = paletted, 24/32 = RGB/RGBA
-	pendingFilter bool   // bilinear filter flag for RGB textures
-	pendingW      int32  // texture width (matches the pixel buffer, not necessarily s.Size)
-	pendingH      int32  // texture height
-	sffv1BasePal bool // SFFv1 sprite palette duplicates the base palette
+	pendingData   []byte         // raw pixel data (nil if no pending texture)
+	lazyTexture   func() Texture // software-only SFFv2 decode on first use; shared by linked sprites
+	noEagerUpload bool           // temporary CPU decode, never enqueue GPU work
+	pendingDepth  int32          // bit depth: 0 = none, 8 = paletted, 24/32 = RGB/RGBA
+	pendingFilter bool           // bilinear filter flag for RGB textures
+	pendingW      int32          // texture width (matches the pixel buffer, not necessarily s.Size)
+	pendingH      int32          // texture height
+	sffv1BasePal  bool           // SFFv1 sprite palette duplicates the base palette
 }
 
 func (s *Sprite) isBlank() bool {
-	return (s.Tex == nil && s.pendingDepth == 0) || s.Size[0] == 0 || s.Size[1] == 0
+	return (s.Tex == nil && s.pendingDepth == 0 && s.lazyTexture == nil) || s.Size[0] == 0 || s.Size[1] == 0
 }
 
 // releaseTextures immediately frees the GPU resources held by this sprite's
@@ -848,6 +850,7 @@ func (s *Sprite) shareCopy(src *Sprite) {
 
 	// Copy pending texture data for deferred creation
 	s.pendingData = src.pendingData
+	s.lazyTexture = src.lazyTexture
 	s.pendingDepth = src.pendingDepth
 	s.pendingFilter = src.pendingFilter
 	s.pendingW = src.pendingW
@@ -915,7 +918,7 @@ func (s *Sprite) SetPxl(px []byte) {
 	s.pendingH = int32(s.Size[1])
 	memSpriteStaged(len(px))
 
-	if sys.cfg.Debug.EagerSpriteTextures {
+	if sys.cfg.Debug.EagerSpriteTextures && !s.noEagerUpload {
 		sys.mainThreadTask <- func() { s.ensureTex() }
 	}
 }
@@ -943,7 +946,7 @@ func (s *Sprite) SetRaw(data []byte, sprWidth int32, sprHeight int32, sprDepth i
 	s.pendingH = sprHeight
 	memSpriteStaged(len(data))
 
-	if sys.cfg.Debug.EagerSpriteTextures {
+	if sys.cfg.Debug.EagerSpriteTextures && !s.noEagerUpload {
 		sys.mainThreadTask <- func() { s.ensureTex() }
 	}
 }
@@ -1492,6 +1495,10 @@ func (s *Sprite) readV2(f io.ReadSeeker, offset int64, datasize uint32) error {
 // ensureTex creates the OpenGL texture from pending pixel data if it hasn't
 // been created yet. Must be called from the main (rendering) thread.
 func (s *Sprite) ensureTex() {
+	if s.lazyTexture != nil {
+		s.Tex = s.lazyTexture()
+		return
+	}
 	if s.Tex != nil || s.pendingDepth == 0 || len(s.pendingData) == 0 {
 		return
 	}
@@ -1499,7 +1506,13 @@ func (s *Sprite) ensureTex() {
 	// ponytail: deferred sprite upload uses fallible newTexture; log and keep pending on VRAM exhaustion
 	var tex Texture
 	var err error
-	if s.pendingDepth == 8 {
+	if sw, ok := gfx.(interface {
+		newSpriteTexture([]byte, int32, int32, int32, bool) Texture
+	}); ok {
+		// Sprite pixels are immutable. Share their backing instead of allocating
+		// and copying another full image on a CPU renderer.
+		tex = sw.newSpriteTexture(s.pendingData, s.pendingW, s.pendingH, s.pendingDepth, s.pendingFilter)
+	} else if s.pendingDepth == 8 {
 		tex, err = gfx.newTexture(s.pendingW, s.pendingH, 8, false)
 	} else {
 		tex, err = gfx.newTexture(s.pendingW, s.pendingH, s.pendingDepth, s.pendingFilter)
@@ -1509,7 +1522,11 @@ func (s *Sprite) ensureTex() {
 		return
 	}
 	s.Tex = tex
-	s.Tex.SetData(s.pendingData)
+	if _, ok := gfx.(interface {
+		newSpriteTexture([]byte, int32, int32, int32, bool) Texture
+	}); !ok {
+		s.Tex.SetData(s.pendingData)
+	}
 	s.pendingData = nil
 	s.pendingDepth = 0
 	s.pendingW = 0
@@ -1879,7 +1896,11 @@ func loadSff(filename string, char bool, isMainThread bool, isActPal bool) (*Sff
 					}
 				}
 			case 2:
-				if err := spriteList[i].readV2(f, int64(xofs), size); err != nil {
+				if sw, ok := gfx.(interface {
+					deferSprite(*Sprite, string, int64, uint32)
+				}); ok && os.Getenv("IKEMEN_LOW_MEMORY") == "1" {
+					sw.deferSprite(spriteList[i], filename, int64(xofs), size)
+				} else if err := spriteList[i].readV2(f, int64(xofs), size); err != nil {
 					return nil, err
 				}
 			}

@@ -2170,6 +2170,7 @@ func (a *Anim) Copy() *Anim {
 
 		dst.Tex = src.Tex
 		dst.pendingData = src.pendingData
+		dst.lazyTexture = src.lazyTexture
 		dst.pendingDepth = src.pendingDepth
 		dst.pendingFilter = src.pendingFilter
 		dst.pendingW = src.pendingW

@@ -13,10 +13,9 @@ type swVertex struct {
 
 // swQuadState carries everything the rasterizer needs for one quad: the
 // resolved shader uniforms and blend state of one SpriteDrawCall / RenderQuad.
-// RenderQuad and flushSWQueue take instances from swQuadStatePool instead of
-// allocating per draw: for large quads the state escapes into the row-pool jobs
-// (via swRowDraw.q), and a fresh struct per quad was the largest flat
-// allocation in the software renderer's profiles.
+// Immediate draws use renderer-owned scratch state; queued/font draws use
+// swQuadStatePool. Row workers finish before reuse, and GPU fallback captures
+// a snapshot. This avoids the per-quad heap allocations seen in older profiles.
 type swQuadState struct {
 	isFlat           bool
 	mask             int32
@@ -92,11 +91,36 @@ func isAxisRect(v0, v1, v2, v3 swVertex) bool {
 		Abs((v0.v-v1.v)-(v2.v-v3.v)) <= eps
 }
 
-// pixelRange maps a window-coordinate interval [min,max) to the integer pixel
-// indices whose fragment centers fall inside it (GL top-left fill rule).
+// swCeilPixel avoids double-precision rounding on the common coordinate path.
+func swFloorPixel(v float32) int {
+	if v >= -1<<30 && v <= 1<<30 {
+		n := int(v)
+		if float32(n) > v {
+			n--
+		}
+		return n
+	}
+	return int(math.Floor(float64(v)))
+}
+
+func swCeilPixel(v float32) int {
+	// Float32-to-int truncation plus one comparison gives ceil for ordinary
+	// screen coordinates, including negative positions. Leave NaN/infinities
+	// and extreme values on the original conversion path (also on ARM32).
+	if v >= -1<<30 && v <= 1<<30 {
+		n := int(v)
+		if float32(n) < v {
+			n++
+		}
+		return n
+	}
+	return int(math.Ceil(float64(v)))
+}
+
+// pixelRange maps [min,max) to pixels whose centers fall inside it (top-left rule).
 func pixelRange(min, max float32) (int, int) {
-	p0 := int(math.Ceil(float64(min - 0.5)))
-	p1 := int(math.Ceil(float64(max-0.5))) - 1
+	p0 := swCeilPixel(min - 0.5)
+	p1 := swCeilPixel(max-0.5) - 1
 	if p1 < p0 {
 		return p0, p0 - 1
 	}
@@ -110,6 +134,15 @@ func (r *Renderer_SW) rasterizeQuadWindow(q *swQuadState, v0, v1, v2, v3 swVerte
 	if !q.isFlat && q.tex == nil {
 		return
 	}
+	mode, tab := r.swBlendMode(q), r.quadPalette(q)
+	if !q.isTrapez && isAxisRect(v0, v1, v2, v3) {
+		r.rasterRect(q, v0, v1, v2, v3, mode, tab)
+	} else {
+		r.rasterGeneric(q, v0, v1, v2, v3, mode, tab)
+	}
+}
+
+func (r *Renderer_SW) quadPalette(q *swQuadState) []byte {
 	// The immediate path only calls SetTexture("pal") for paletted sprites and
 	// never clears it, so an RGBA (depth 24/32) sprite drawn right after a
 	// paletted one would see a stale palette and get mis-sampled as 8-bit
@@ -118,7 +151,6 @@ func (r *Renderer_SW) rasterizeQuadWindow(q *swQuadState, v0, v1, v2, v3 swVerte
 	if q.pal != nil && (q.tex == nil || q.tex.depth != 8) {
 		q.pal = nil
 	}
-	mode := r.swBlendMode(q)
 	var tab []byte
 	if q.pal != nil {
 		// Memoize the PalFX-applied palette table. buildPalTable runs 256
@@ -131,22 +163,22 @@ func (r *Renderer_SW) rasterizeQuadWindow(q *swQuadState, v0, v1, v2, v3 swVerte
 			r.palTableCache = make(map[swPalKey]*[2048]byte)
 		}
 		key := swPalKeyFor(q)
-		if p, ok := r.palTableCache[key]; ok {
+		if r.lastPalTable != nil && r.lastPalKey == key {
+			tab = r.lastPalTable[:]
+		} else if p, ok := r.palTableCache[key]; ok {
 			tab = p[:]
+			r.lastPalKey, r.lastPalTable = key, p
 		} else {
 			t := buildPalTable(q.pal, q)
 			r.palTableCache[key] = &t
 			tab = t[:]
+			r.lastPalKey, r.lastPalTable = key, &t
 			if len(r.palTableCache) > swPalTableCacheMax {
 				r.palTableCache = make(map[swPalKey]*[2048]byte)
 			}
 		}
 	}
-	if !q.isTrapez && isAxisRect(v0, v1, v2, v3) {
-		r.rasterRect(q, v0, v1, v2, v3, mode, tab)
-	} else {
-		r.rasterGeneric(q, v0, v1, v2, v3, mode, tab)
-	}
+	return tab
 }
 
 // clipRangeX clips a pixel column range to the screen and the quad's scissor
@@ -193,14 +225,15 @@ func (r *Renderer_SW) clipRangeY(q *swQuadState, py0, py1 int) (int, int, bool) 
 // ---- Axis-aligned rect fast path ----
 
 func (r *Renderer_SW) rasterRect(q *swQuadState, v0, v1, v2, v3 swVertex, mode int, tab []byte) {
-	xLeft := float32(math.Min(math.Min(float64(v0.x), float64(v1.x)), math.Min(float64(v2.x), float64(v3.x))))
-	xRight := float32(math.Max(math.Max(float64(v0.x), float64(v1.x)), math.Max(float64(v2.x), float64(v3.x))))
-	yTop := float32(math.Max(math.Max(float64(v0.y), float64(v1.y)), math.Max(float64(v2.y), float64(v3.y))))
-	yBot := float32(math.Min(math.Min(float64(v0.y), float64(v1.y)), math.Min(float64(v2.y), float64(v3.y))))
+	xLeft := min(v0.x, v1.x, v2.x, v3.x)
+	xRight := max(v0.x, v1.x, v2.x, v3.x)
+	yTop := max(v0.y, v1.y, v2.y, v3.y)
+	yBot := min(v0.y, v1.y, v2.y, v3.y)
 	if xRight <= xLeft || yTop <= yBot {
 		return
 	}
 	px0, px1 := pixelRange(xLeft, xRight)
+	fullPx0, fullPx1 := px0, px1
 	py0, py1 := pixelRange(float32(r.h)-yTop, float32(r.h)-yBot)
 	px0, px1, okX := r.clipRangeX(q, px0, px1)
 	py0, py1, okY := r.clipRangeY(q, py0, py1)
@@ -272,7 +305,6 @@ func (r *Renderer_SW) rasterRect(q *swQuadState, v0, v1, v2, v3 swVertex, mode i
 	// sub-range a per-fragment GPU would; dividing the step by n instead
 	// squeezed the entire texture into the visible sliver, making stage
 	// backgrounds look stretched while scrolling.
-	fullPx0, fullPx1 := pixelRange(xLeft, xRight)
 	wSpanPix := fullPx1 - fullPx0 + 1
 	if wSpanPix < 1 {
 		wSpanPix = 1
@@ -320,10 +352,10 @@ func (r *Renderer_SW) rasterRect(q *swQuadState, v0, v1, v2, v3 swVertex, mode i
 // ---- Generic affine-triangle path (rotation, trapezoid, tiled quads) ----
 
 func (r *Renderer_SW) rasterGeneric(q *swQuadState, v0, v1, v2, v3 swVertex, mode int, tab []byte) {
-	minX := float32(math.Min(math.Min(float64(v0.x), float64(v1.x)), math.Min(float64(v2.x), float64(v3.x))))
-	maxX := float32(math.Max(math.Max(float64(v0.x), float64(v1.x)), math.Max(float64(v2.x), float64(v3.x))))
-	minY := float32(math.Min(math.Min(float64(v0.y), float64(v1.y)), math.Min(float64(v2.y), float64(v3.y))))
-	maxY := float32(math.Max(math.Max(float64(v0.y), float64(v1.y)), math.Max(float64(v2.y), float64(v3.y))))
+	minX := min(v0.x, v1.x, v2.x, v3.x)
+	maxX := max(v0.x, v1.x, v2.x, v3.x)
+	minY := min(v0.y, v1.y, v2.y, v3.y)
+	maxY := max(v0.y, v1.y, v2.y, v3.y)
 	px0, px1 := pixelRange(minX, maxX)
 	py0, py1 := pixelRange(float32(r.h)-maxY, float32(r.h)-minY)
 	px0, px1, okX := r.clipRangeX(q, px0, px1)
@@ -489,8 +521,8 @@ func (t *swTexture) sampleIndex(u, v float32) int {
 func (t *swTexture) sampleIndexBilinear(u, v float32) int {
 	w := int(t.width)
 	h := int(t.height)
-	x0 := int(math.Floor(float64(u*float32(w) - 0.5)))
-	y0 := int(math.Floor(float64(v*float32(h) - 0.5)))
+	x0 := swFloorPixel(u*float32(w) - 0.5)
+	y0 := swFloorPixel(v*float32(h) - 0.5)
 	fx := u*float32(w) - 0.5 - float32(x0)
 	fy := v*float32(h) - 0.5 - float32(y0)
 	x0 = swClampIdx(x0, w)
@@ -534,8 +566,8 @@ func (t *swTexture) sampleRGBA(u, v float32) (float32, float32, float32, float32
 func (t *swTexture) sampleRGBAFiltered(u, v float32) (float32, float32, float32, float32) {
 	w := int(t.width)
 	h := int(t.height)
-	x0 := int(math.Floor(float64(u*float32(w) - 0.5)))
-	y0 := int(math.Floor(float64(v*float32(h) - 0.5)))
+	x0 := swFloorPixel(u*float32(w) - 0.5)
+	y0 := swFloorPixel(v*float32(h) - 0.5)
 	fx := u*float32(w) - 0.5 - float32(x0)
 	fy := v*float32(h) - 0.5 - float32(y0)
 	x0 = swClampIdx(x0, w)

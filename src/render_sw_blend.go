@@ -124,18 +124,18 @@ func swRgb2Hsv(r, g, b float32) (float32, float32, float32) {
 	} else {
 		w0, w1, w2, w3 = r, q1, q3, q0
 	}
-	d := w0 - float32(math.Min(float64(w3), float64(w1)))
+	d := w0 - min(w3, w1)
 	const e = 1.0e-10
-	h := float32(math.Abs(float64(w2 + (w3-w1)/(6*d+e))))
+	h := swAbs32(w2 + (w3-w1)/(6*d+e))
 	s := d / (w0 + e)
 	return h, s, w0
 }
 
 func swHsv2Rgb(h, s, v float32) (float32, float32, float32) {
 	K0, K1, K2, K3 := float32(1.0), float32(2.0/3.0), float32(1.0/3.0), float32(3.0)
-	p0 := float32(math.Abs(float64(mod1f(h+K0)*6 - K3)))
-	p1 := float32(math.Abs(float64(mod1f(h+K1)*6 - K3)))
-	p2 := float32(math.Abs(float64(mod1f(h+K2)*6 - K3)))
+	p0 := swAbs32(mod1f(h+K0)*6 - K3)
+	p1 := swAbs32(mod1f(h+K1)*6 - K3)
+	p2 := swAbs32(mod1f(h+K2)*6 - K3)
 	clamp := func(x float32) float32 {
 		if x < 0 {
 			return 0
@@ -155,7 +155,23 @@ func swHsv2Rgb(h, s, v float32) (float32, float32, float32) {
 	return r, g, b
 }
 
+func swAbs32(x float32) float32 {
+	return math.Float32frombits(math.Float32bits(x) & 0x7fffffff)
+}
+
 func mod1f(x float32) float32 {
+	// Finite float32 values beyond this interval are already integers.
+	// Keep exceptional values on math.Mod's established path.
+	if x > -1<<23 && x < 1<<23 {
+		m := x - float32(int32(x))
+		if m < 0 {
+			m += 1
+		}
+		if m == 0 {
+			return math.Float32frombits(math.Float32bits(x) & 0x80000000)
+		}
+		return m
+	}
 	m := float32(math.Mod(float64(x), 1.0))
 	if m < 0 {
 		m += 1
@@ -332,6 +348,15 @@ func swBlendFuncName(f BlendFunc) string {
 // []byte param would re-emit for every dst[i]; callers convert once with
 // (*[4]byte)(row[i*4:]).
 func swBlendAlphaOver(dst *[4]byte, sp0, sp1, sp2, sa int) {
+	// Most indexed MUGEN pixels are fully opaque or fully transparent.
+	// Avoid destination reads and blend-table traffic for these exact cases.
+	if sa == 255 {
+		dst[0], dst[1], dst[2], dst[3] = byte(sp0), byte(sp1), byte(sp2), 255
+		return
+	}
+	if sa == 0 && sp0 == 0 && sp1 == 0 && sp2 == 0 {
+		return
+	}
 	dr, dg, db, da := int(dst[0]), int(dst[1]), int(dst[2]), int(dst[3])
 	dst[0] = byte(sp0 + int(oneMinusMul255[sa][dr]))
 	dst[1] = byte(sp1 + int(oneMinusMul255[sa][dg]))

@@ -6504,6 +6504,9 @@ func (c *Char) getOwnChannels(chNo int32) (found []*SoundChannel) {
 }
 
 func (c *Char) playSound(params *PlaySndParams) {
+	if nativeAudioDisabled {
+		return
+	}
 	if params.group < 0 || sys.noCharSoundFlg {
 		return
 	}
@@ -6786,7 +6789,7 @@ func (c *Char) stateChange1(no int32, pn int) bool {
 func (c *Char) persistentChangeStateHitpauseCorrection(sbc *StateBytecode) {
 	// Nested structures do not need to be considered
 	for _, sctrl := range sbc.block.ctrls {
-		if sctrlBlock, ok := sctrl.(StateBlock); ok {
+		if sctrlBlock, ok := sctrl.(*StateBlock); ok {
 			idx := sctrlBlock.persistentIndex
 			if idx >= 0 && int(idx) < len(sbc.ctrlsps) {
 				// If the destination SCTRL is persistent=0 (run-once)

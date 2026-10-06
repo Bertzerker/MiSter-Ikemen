@@ -1,4 +1,4 @@
-//go:build desktop || mugen
+//go:build (desktop || mugen) && !softwareonly
 
 package main
 

@@ -1,0 +1,12 @@
+/db/
+/incremental_db/
+/output_files/
+/build_id.v
+/grey.hex
+/jtag.cdf
+/c5_pin_model_dump.txt
+/*.qws
+/*.bak
+/*.smsg
+/*.jdi
+/*.summary

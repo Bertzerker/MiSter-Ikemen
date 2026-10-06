@@ -3,6 +3,7 @@
 package main
 
 import (
+	"container/list"
 	"fmt"
 	"image"
 	"image/png"
@@ -15,8 +16,8 @@ import (
 	"github.com/ikemen-engine/Ikemen-GO/packages/go-sdl2/sdl"
 )
 
-// swQuadStatePool recycles the per-quad rasterizer state. RenderQuad and
-// flushSWQueue take the state from the pool instead of building a fresh value:
+// swQuadStatePool recycles state for queued and font draws. Immediate draws
+// use renderer-owned scratch state instead of building a fresh value:
 // for quads large enough to cross the parallel-row threshold the state escapes
 // into the row-pool jobs (via swRowDraw.q), and a fresh swQuadState per quad
 // showed up as the single largest flat allocation in the software renderer's
@@ -28,7 +29,16 @@ var swQuadStatePool = sync.Pool{
 // swTexture is the CPU-side texture for the software renderer. Pixel data lives
 // in ordinary Go memory: depth 8 = palette indices, 24 = RGB, 32 = RGBA bytes,
 // palette textures (palSlot) = 256 RGBA entries. Sampling is done directly on
-// the []byte; there is no GPU upload until the final present blit.
+// the []byte unless the optional Frontier FPGA row renderer accepts the draw.
+// Native display backends consume completed frames and may implement swGPUSink.
+// Desktop builds leave the factory unset and retain SDL presentation.
+type swVideoSink interface {
+	Present([]byte, int, int, int) error
+	Close()
+}
+
+var swVideoSinkFactory func(int, int) (swVideoSink, error)
+
 type swTexture struct {
 	width, height, depth int32
 	filter               bool // bilinear sampling (RGB sprites with RGBSpriteBilinearFilter)
@@ -37,11 +47,16 @@ type swTexture struct {
 	serial               uint64
 	dataVersion          uint64 // bumped whenever data changes (palette cache key)
 	released             bool
+	immutable            bool // sprite storage can be shared by SFF links
 }
 
 func (t *swTexture) SetData(data []byte) {
 	if data == nil || t.released {
 		return
+	}
+	if t.immutable {
+		t.data = nil
+		t.immutable = false
 	}
 	t.data = append(t.data[:0], data...)
 	t.dataVersion++
@@ -50,6 +65,10 @@ func (t *swTexture) SetData(data []byte) {
 func (t *swTexture) SetSubData(data []byte, x, y, width, height, stride int32) {
 	if data == nil || t.released {
 		return
+	}
+	if t.immutable {
+		t.data = append([]byte(nil), t.data...)
+		t.immutable = false
 	}
 	bpp := t.depth / 8
 	if bpp < 1 {
@@ -110,6 +129,10 @@ func (t *swTexture) CopyData(src *Texture) {
 		return
 	}
 	if s, ok := (*src).(*swTexture); ok && s.data != nil {
+		if t.immutable {
+			t.data = append([]byte(nil), t.data...)
+			t.immutable = false
+		}
 		n := Min(len(s.data), len(t.data))
 		copy(t.data[:n], s.data[:n])
 		t.dataVersion++
@@ -130,14 +153,20 @@ func (t swTexture) MarkNonSwappable() {
 // to a streaming SDL texture and presented via SDL_RenderCopy/Present.
 // See RENDERER_PLAN.md.
 type Renderer_SW struct {
-	renderer *sdl.Renderer
-	target   *sdl.Texture
-	pix      []byte // RGBA bytes, top-down, pitch = w*4
-	pitch    int
-	w, h     int32
+	gpu              *swGPUState
+	spriteCache      list.List // only decoded SFFv2 textures; oldest at the front
+	spriteCacheBytes int
+	renderer         *sdl.Renderer
+	target           *sdl.Texture
+	pix              []byte // RGBA bytes, top-down, pitch = w*4
+	pitch            int
+	w, h             int32
 
 	// Virtual pipeline state for the immediate draw path (RenderQuad).
 	curProjection, curModelview       mgl.Mat4
+	curTransform                      mgl.Mat4
+	curTransformValid                 bool
+	immediateState                    swQuadState
 	curIsFlat, curIsRgba, curIsTrapez bool
 	curMask                           int32
 	curHue                            float32
@@ -163,7 +192,8 @@ type Renderer_SW struct {
 	// Checking os.Getenv on the render hot path allocates per quad (UTF-16
 	// env lookups escape into the runRows worker closures), which showed up
 	// as a significant per-frame allocation source in profiles.
-	dumpQuad bool
+	dumpQuad         bool
+	disableTileBatch bool
 
 	// Palette table cache: buildPalTable applies the PalFX chain to the
 	// 256-entry palette once per draw call. Memoizing by (palette identity +
@@ -171,6 +201,9 @@ type Renderer_SW struct {
 	// (whose backing array escaped to the heap through the rasterizer
 	// workers) into a pointer lookup after warm-up.
 	palTableCache map[swPalKey]*[2048]byte
+	lastPalKey    swPalKey
+	lastPalTable  *[2048]byte
+	videoSink     swVideoSink
 
 	// Dirty-rect tracking: only the touched region is uploaded at present.
 	dirty                              bool
@@ -184,11 +217,31 @@ func (r *Renderer_SW) DebugInfo() string {
 }
 
 func (r *Renderer_SW) Init() {
+	// Opt-in only: the first bounded gameplay comparison was slower.
+	r.disableTileBatch = os.Getenv("IKEMEN_SW_TILE_BATCH") != "1"
 	r.w, r.h = sys.scrrect[2], sys.scrrect[3]
 	r.pitch = int(r.w) * 4
 	r.pix = make([]byte, int(r.w)*int(r.h)*4)
 
 	var err error
+	if swVideoSinkFactory != nil {
+		r.videoSink, err = swVideoSinkFactory(int(r.w), int(r.h))
+		if err != nil {
+			panic(err)
+		}
+		r.customShaderLogged = make(map[string]bool)
+		r.blendStateLogged = make(map[string]bool)
+		r.palTableCache = make(map[swPalKey]*[2048]byte)
+		if sink, ok := r.videoSink.(swGPUSink); ok && sink.GPUAvailable() {
+			r.gpu = &swGPUState{sink: sink, textures: make(map[swGPUTextureKey]*swGPUTexture), reasons: make(map[int]int)}
+			r.gpu.async = os.Getenv("IKEMEN_GPU_ASYNC") != "0"
+			if capability, ok := sink.(interface{ GPUGroupedRows() bool }); ok {
+				r.gpu.groupRows = capability.GPUGroupedRows() && os.Getenv("IKEMEN_GPU_GROUP_ROWS") == "1"
+			}
+			fmt.Fprintf(os.Stderr, "[Frontier GPU] FPGA row renderer enabled; grouped rows=%t\n", r.gpu.groupRows)
+		}
+		return
+	}
 	r.renderer, err = sdl.CreateRenderer(sys.window.Window, -1, sdl.RENDERER_ACCELERATED)
 	if err != nil {
 		LogMessage("[SDL2 Software] SDL_CreateRenderer failed (%v); retrying with the software driver", err)
@@ -221,6 +274,11 @@ func (r *Renderer_SW) Init() {
 }
 
 func (r *Renderer_SW) Close() {
+	r.gpuWait()
+	if r.videoSink != nil {
+		r.videoSink.Close()
+		r.videoSink = nil
+	}
 	if r.target != nil {
 		_ = r.target.Destroy()
 		r.target = nil
@@ -247,13 +305,30 @@ func (r *Renderer_SW) BeginFrame(clearColor bool) {
 	r.curScissorOn = false
 	r.curBlending = false
 	r.curPipeline = ""
+	r.gpuBegin(clearColor)
 }
 
 func (r *Renderer_SW) EndFrame() {
 	flushSpriteQueue()
 	drawCallStats.logFrame(int(sys.frameCounter))
+	if !r.gpuEnd() {
+		r.present()
+	}
 	r.dumpFrame()
-	r.present()
+	r.trimSpriteCache(64 * 1024 * 1024)
+}
+
+func (r *Renderer_SW) trimSpriteCache(limit int) {
+	// Evict only after all queued draws and worker rows have completed.
+	// The next ensureTex re-decodes an evicted image from its SFF file.
+	for r.spriteCacheBytes > limit && r.spriteCache.Len() > 0 {
+		e := r.spriteCache.Front()
+		item := e.Value.(*swCachedSprite)
+		r.spriteCacheBytes -= item.bytes
+		item.texture.data = nil
+		item.resident = false
+		r.spriteCache.Remove(e)
+	}
 }
 
 // dumpFrame writes the framebuffer to a PNG every 60 frames when
@@ -263,6 +338,7 @@ func (r *Renderer_SW) dumpFrame() {
 	if dir == "" || sys.frameCounter%60 != 0 {
 		return
 	}
+	r.gpuSync()
 	img := image.NewRGBA(image.Rect(0, 0, int(r.w), int(r.h)))
 	for y := 0; y < int(r.h); y++ {
 		copy(img.Pix[y*int(r.w)*4:(y+1)*int(r.w)*4], r.pix[y*r.pitch:y*r.pitch+r.pitch])
@@ -281,6 +357,12 @@ func (r *Renderer_SW) dumpFrame() {
 func (r *Renderer_SW) Await() {}
 
 func (r *Renderer_SW) present() {
+	if r.videoSink != nil {
+		if err := r.videoSink.Present(r.pix, int(r.w), int(r.h), r.pitch); err != nil {
+			panic(err)
+		}
+		return
+	}
 	if r.target == nil || r.renderer == nil {
 		return
 	}
@@ -544,10 +626,26 @@ func (r *Renderer_SW) SetUniformMatrix(name string, value []float32) {
 	var m mgl.Mat4
 	copy(m[:], value[:16])
 	if name == "projection" {
+		if r.curProjection != m {
+			r.curTransformValid = false
+		}
 		r.curProjection = m
 	} else if name == "modelview" {
+		if r.curModelview != m {
+			r.curTransformValid = false
+		}
 		r.curModelview = m
 	}
+}
+
+// Adjacent tiles submit the same matrices. Reuse their product without
+// changing the vertex arithmetic or rounding used by the rasterizer.
+func (r *Renderer_SW) quadTransform() mgl.Mat4 {
+	if !r.curTransformValid {
+		r.curTransform = r.curProjection.Mul4(r.curModelview)
+		r.curTransformValid = true
+	}
+	return r.curTransform
 }
 
 func (r *Renderer_SW) SetTexture(name string, tex Texture) {
@@ -563,6 +661,19 @@ func (r *Renderer_SW) SetVertexData(values ...float32) {
 	n := Min(len(values), 16)
 	copy(r.curVerts[:n], values[:n])
 	r.curHasVerts = n == 16
+}
+
+// Preserve Mul4x1's operation order for z=0,w=1, without copying a Mat4
+// per vertex or calculating the unused depth coordinate.
+func swWindowVertex(m *mgl.Mat4, x, y, u, v, hw, hh float32) swVertex {
+	xp := m[0]*x + m[4]*y + m[8]*0 + m[12]
+	yp := m[1]*x + m[5]*y + m[9]*0 + m[13]
+	wp := m[3]*x + m[7]*y + m[11]*0 + m[15]
+	if wp != 0 && wp != 1 {
+		xp /= wp
+		yp /= wp
+	}
+	return swVertex{(xp + 1) * hw, (yp + 1) * hh, u, v}
 }
 
 func (r *Renderer_SW) RenderQuad() {
@@ -581,20 +692,12 @@ func (r *Renderer_SW) RenderQuad() {
 	// when IKEMEN_SW_DUMP_QUAD=1 (read once at Init; checking the env var per
 	// quad allocated on the hot path), so we can see exactly what is drawn where.
 	if r.dumpQuad && sys.frameCounter < 6 {
-		mat := r.curProjection.Mul4(r.curModelview)
+		mat := r.quadTransform()
 		hw := float32(r.w) * 0.5
 		hh := float32(r.h) * 0.5
 		var v [4]swVertex
 		for i := 0; i < 4; i++ {
-			p := mat.Mul4x1(mgl.Vec4{r.curVerts[i*4], r.curVerts[i*4+1], 0, 1})
-			x, y := p.X(), p.Y()
-			if p.W() != 0 {
-				x /= p.W()
-				y /= p.W()
-			}
-			x = (x + 1) * hw
-			y = (y + 1) * hh
-			v[i] = swVertex{x, y, r.curVerts[i*4+2], r.curVerts[i*4+3]}
+			v[i] = swWindowVertex(&mat, r.curVerts[i*4], r.curVerts[i*4+1], r.curVerts[i*4+2], r.curVerts[i*4+3], hw, hh)
 		}
 		minX := v[0].x
 		minY := v[0].y
@@ -651,24 +754,23 @@ func (r *Renderer_SW) RenderQuad() {
 	// Transform the quad strip vertices (x, y, u, v) by projection × modelview.
 	// GL33 vertex shader does the same, then the GPU viewport maps NDC to pixels.
 	// We replicate the viewport: NDC [-1,1] → window coords [0,w]×[0,h] (y-up).
-	mat := r.curProjection.Mul4(r.curModelview)
+	mat := r.quadTransform()
 	hw := float32(r.w) * 0.5
 	hh := float32(r.h) * 0.5
 	var v [4]swVertex
 	for i := 0; i < 4; i++ {
-		p := mat.Mul4x1(mgl.Vec4{r.curVerts[i*4], r.curVerts[i*4+1], 0, 1})
-		x, y := p.X(), p.Y()
-		if p.W() != 0 {
-			x /= p.W()
-			y /= p.W()
-		}
-		x = (x + 1) * hw
-		y = (y + 1) * hh
-		v[i] = swVertex{x, y, r.curVerts[i*4+2], r.curVerts[i*4+3]}
+		v[i] = swWindowVertex(&mat, r.curVerts[i*4], r.curVerts[i*4+1], r.curVerts[i*4+2], r.curVerts[i*4+3], hw, hh)
 	}
 
-	q := swQuadStatePool.Get().(*swQuadState)
-	*q = swQuadState{}
+	q := r.immediateQuadState()
+	r.rasterizeQuadWindow(q, v[0], v[1], v[2], v[3])
+	q.tex, q.pal = nil, nil
+}
+
+func (r *Renderer_SW) immediateQuadState() *swQuadState {
+	// Row workers finish before return; GPU replay owns a snapshot. Every
+	// non-font field is assigned below, avoiding a pool visit and full clear.
+	q := &r.immediateState
 	q.isFlat = r.curIsFlat
 	q.mask = r.curMask
 	q.isTrapez = r.curIsTrapez
@@ -686,16 +788,51 @@ func (r *Renderer_SW) RenderQuad() {
 	q.blending = r.curBlending
 	q.hasScissor = r.curScissorOn
 	q.scissor = r.curScissor
+	q.tex, q.pal = nil, nil
 	if t, ok := r.curTex.(*swTexture); ok {
 		q.tex = t
 	}
 	if p, ok := r.curPal.(*swTexture); ok {
 		q.pal = p
 	}
-	r.rasterizeQuadWindow(q, v[0], v[1], v[2], v[3])
-	// rasterizeQuadWindow (and its runRows workers) complete synchronously, so
-	// the state is free to return to the pool here.
-	swQuadStatePool.Put(q)
+	return q
+}
+
+// Resolve invariant state once per sprite/blend pass, rather than once for
+// every repeated tile. Geometry, clipping and exact texture sampling stay shared.
+func (r *Renderer_SW) renderSpriteQuads(modelview mgl.Mat4, rp RenderParams) bool {
+	if r.disableTileBatch || r.dumpQuad || r.curPipeline != "" {
+		return false
+	}
+	q := r.immediateQuadState()
+	if !q.isFlat && q.tex == nil {
+		q.tex, q.pal = nil, nil
+		return true
+	}
+	mode, tab := r.swBlendMode(q), r.quadPalette(q)
+	hw, hh := float32(r.w)*0.5, float32(r.h)*0.5
+	emit := func(mat mgl.Mat4, x1, y1, x2, y2, x3, y3, x4, y4 float32, uv [4]float32) {
+		if r.curModelview != mat {
+			r.curModelview, r.curTransformValid = mat, false
+		}
+		transform := r.quadTransform()
+		q.x1x2x4x3 = [4]float32{x1, x2, x4, x3}
+		r.curX1x2x4x3 = q.x1x2x4x3
+		u1, v1 := Max(uv[0], float32(0.000002)), Max(uv[1], float32(0))
+		u2, v2 := Max(uv[2]-float32(0.000002), float32(0.000002)), Max(uv[3]-float32(0.000002), float32(0))
+		a := swWindowVertex(&transform, x2, y2, u2, v2, hw, hh)
+		b := swWindowVertex(&transform, x3, y3, u2, v1, hw, hh)
+		c := swWindowVertex(&transform, x1, y1, u1, v2, hw, hh)
+		d := swWindowVertex(&transform, x4, y4, u1, v1, hw, hh)
+		if !q.isTrapez && isAxisRect(a, b, c, d) {
+			r.rasterRect(q, a, b, c, d, mode, tab)
+		} else {
+			r.rasterGeneric(q, a, b, c, d, mode, tab)
+		}
+	}
+	renderSpriteQuad(modelview, rp, emit)
+	q.tex, q.pal = nil, nil
+	return true
 }
 
 // flushSWQueue rasterizes the deferred sprite queue on the CPU. Called from
@@ -750,6 +887,7 @@ func (r *Renderer_SW) flushSWQueue(queue []SpriteDrawCall) {
 // ---- Misc ----
 
 func (r *Renderer_SW) ReadPixels(data []uint8, width, height int) {
+	r.gpuFallback()
 	// GL-compatible: row 0 is the BOTTOM of the image.
 	if width == int(r.w) && height == int(r.h) {
 		for y := 0; y < height; y++ {

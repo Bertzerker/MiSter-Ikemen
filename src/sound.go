@@ -12,6 +12,7 @@ import (
 
 	"github.com/gopxl/beep/v2"
 	"github.com/gopxl/beep/v2/effects"
+	"github.com/ikemen-engine/Ikemen-GO/internal/mistermusic"
 
 	"github.com/gopxl/beep/v2/flac"
 	"github.com/gopxl/beep/v2/midi"
@@ -51,6 +52,15 @@ func (n *Normalizer) Stream(samples [][2]float64) (s int, ok bool) {
 	}
 	s, ok = n.streamer.Stream(samples)
 	wavVolumeMul := 0.5 * (float64(sys.cfg.Sound.WavVolume) * float64(sys.cfg.Sound.MasterVolume) * 0.0001)
+	if !sys.cfg.Sound.AudioDucking {
+		d1 := float64(sys.cfg.Sound.SampleRate)/110.0 + 1
+		d2 := float64(sys.cfg.Sound.SampleRate)/112640.0 + 1
+		for i := range samples[:s] {
+			n.l.processFixedCoefficients(wavVolumeMul, &samples[i][0], d1, d2)
+			n.r.processFixedCoefficients(wavVolumeMul, &samples[i][1], d1, d2)
+		}
+		return s, ok
+	}
 	for i := range samples[:s] {
 		if sys.cfg.Sound.AudioDucking {
 			lmul := n.l.process(n.mul, &samples[i][0])
@@ -61,8 +71,8 @@ func (n *Normalizer) Stream(samples [][2]float64) (s int, ok bool) {
 			n.mul = math.Min(16.0, math.Min(lmul, rmul))
 		} else {
 			// Apply the configured WAV/master volume directly through the normalizer path.
-			n.l.process(wavVolumeMul, &samples[i][0])
-			n.r.process(wavVolumeMul, &samples[i][1])
+			n.l.processFixed(wavVolumeMul, &samples[i][0])
+			n.r.processFixed(wavVolumeMul, &samples[i][1])
 		}
 	}
 	return s, ok
@@ -77,6 +87,22 @@ func (n *Normalizer) Err() error {
 
 type NormalizerLR struct {
 	edge, edgeDelta, gain, average, bias, bias2 float64
+}
+
+// With adaptive gain disabled, only the filters and output limiter affect the
+// samples. Keep their arithmetic identical; freeze the unused adaptive state.
+func (n *NormalizerLR) processFixed(mul float64, sam *float64) {
+	n.processFixedCoefficients(mul, sam, float64(sys.cfg.Sound.SampleRate)/110.0+1, float64(sys.cfg.Sound.SampleRate)/112640.0+1)
+}
+
+func (n *NormalizerLR) processFixedCoefficients(mul float64, sam *float64, d1, d2 float64) {
+	n.bias += (*sam - n.bias) / d1
+	n.bias2 += (*sam - n.bias2) / d2
+	s := (n.bias2 - n.bias) * mul
+	if math.Abs(s) > 1 {
+		s = math.Copysign(1.0, s)
+	}
+	*sam = s
 }
 
 func (n *NormalizerLR) process(mul float64, sam *float64) float64 {
@@ -326,6 +352,7 @@ type Bgm struct {
 	startPos           int
 	mu                 sync.Mutex
 	cancel             context.CancelFunc
+	preparing          bool // main-thread state; worker only owns its decoder
 }
 
 func newBgm() *Bgm {
@@ -333,6 +360,12 @@ func newBgm() *Bgm {
 }
 
 func (bgm *Bgm) Stop() {
+	bgm.preparing = false
+	bgm.mu.Lock()
+	if bgm.cancel != nil {
+		bgm.cancel()
+	}
+	bgm.mu.Unlock()
 	if bgm.ctrl != nil {
 		WithSpeakerLock(func() {
 			bgm.ctrl.Streamer = nil
@@ -344,6 +377,8 @@ func (bgm *Bgm) Stop() {
 }
 
 func (bgm *Bgm) Open(filename string, loop, bgmVolume, bgmLoopStart, bgmLoopEnd, startPosition int, freqmul float32, loopcount int) {
+	stallStart := perfStallBegin()
+	defer perfStallEnd(stallStart, "bgm-open")
 	// Right away, cancel any running goroutines.
 	bgm.mu.Lock()
 	if bgm.cancel != nil {
@@ -354,6 +389,7 @@ func (bgm *Bgm) Open(filename string, loop, bgmVolume, bgmLoopStart, bgmLoopEnd,
 	bgm.mu.Unlock()
 
 	bgm.filename = filename
+	bgm.preparing = false
 	bgm.loop = loop
 	bgm.bgmVolume = bgmVolume
 	bgm.freqmul = freqmul
@@ -370,37 +406,86 @@ func (bgm *Bgm) Open(filename string, loop, bgmVolume, bgmLoopStart, bgmLoopEnd,
 		return
 	}
 
-	f, err := OpenFile(bgm.filename)
-	if err != nil {
-		// sys.bgm = *newBgm() // removing this gets pause step playsnd to work correctly 100% of the time
-		LogMessage("Failed to open BGM: %v", err)
+	if _, silent := sys.cmdFlags["-nosound"]; silent {
 		return
 	}
+	if _, silent := sys.cmdFlags["-nomusic"]; silent {
+		return
+	}
+	if os.Getenv("IKEMEN_FRONTIER") == "1" && !sys.cfg.Sound.BGMRAMBuffer &&
+		(HasExtension(filename, ".ogg") || HasExtension(filename, ".mp3")) {
+		bgm.streamer = nil
+		bgm.preparing = true
+		cacheDir, tasks := os.Getenv("IKEMEN_AUDIO_CACHE"), sys.mainThreadTask
+		go queuePreparedMusic(ctx, tasks,
+			func() *preparedMusic { return prepareMusic(filename, cacheDir) },
+			func(p *preparedMusic) { bgm.finishOpen(ctx, p, bgmLoopStart, bgmLoopEnd, startPosition, loopcount) })
+		return
+	}
+	bgm.finishOpen(ctx, nil, bgmLoopStart, bgmLoopEnd, startPosition, loopcount)
+}
+
+func (bgm *Bgm) finishOpen(ctx context.Context, prepared *preparedMusic, bgmLoopStart, bgmLoopEnd, startPosition, loopcount int) {
+	bgm.preparing = false
+	var f io.ReadSeekCloser
+	var err error
 	var format beep.Format
-	if HasExtension(bgm.filename, ".ogg") {
-		bgm.streamer, format, err = vorbis.Decode(f)
-		bgm.format = "ogg"
-	} else if HasExtension(bgm.filename, ".mp3") {
-		bgm.streamer, format, err = mp3.Decode(f)
-		bgm.format = "mp3"
-	} else if HasExtension(bgm.filename, ".wav") {
-		bgm.streamer, format, err = wav.Decode(f)
-		bgm.format = "wav"
-	} else if HasExtension(bgm.filename, ".flac") {
-		bgm.streamer, format, err = flac.Decode(f)
-		bgm.format = "flac"
-	} else if HasExtension(bgm.filename, ".mid") || HasExtension(bgm.filename, ".midi") {
-		if sf, sferr := loadSoundFont(sys.cfg.Sound.SoundFont); sferr != nil {
-			err = sferr
-		} else {
-			bgm.streamer, format, err = midi.Decode(f, sf, beep.SampleRate(int(sys.cfg.Sound.SampleRate)))
-			bgm.format = "midi"
+	cachedMusic := false
+	if prepared != nil {
+		if prepared.err != nil {
+			prepared.close()
+			LogMessage("Failed to prepare BGM: %v", prepared.err)
+			return
 		}
-	} else if HasExtension(bgm.filename, ".xm") || HasExtension(bgm.filename, ".mod") || HasExtension(bgm.filename, ".it") || HasExtension(bgm.filename, ".s3m") {
-		bgm.streamer, format, err = xmpDecode(f)
-		bgm.format = "xmp"
+		f, bgm.streamer, format, cachedMusic = prepared.file, prepared.stream, prepared.format, prepared.cached
+		if cachedMusic {
+			bgm.format = "wav"
+		} else if HasExtension(bgm.filename, ".ogg") {
+			bgm.format = "ogg"
+		} else {
+			bgm.format = "mp3"
+		}
+		LogMessage("[Frontier] BGM prepared in background (PCM cache=%t): %s", cachedMusic, bgm.filename)
 	} else {
-		err = Error(fmt.Sprintf("unsupported file extension: %v", bgm.filename))
+		f, err = OpenFile(bgm.filename)
+		if err != nil {
+			// sys.bgm = *newBgm() // removing this gets pause step playsnd to work correctly 100% of the time
+			LogMessage("Failed to open BGM: %v", err)
+			return
+		}
+		if HasExtension(bgm.filename, ".ogg") || HasExtension(bgm.filename, ".mp3") {
+			bgm.streamer, format, cachedMusic = mistermusic.OpenCached(f, os.Getenv("IKEMEN_AUDIO_CACHE"))
+		}
+		if cachedMusic {
+			f.Close()
+			bgm.format = "wav"
+			LogMessage("[Frontier] Using disk music cache: %s", bgm.filename)
+		} else if HasExtension(bgm.filename, ".ogg") {
+			bgm.streamer, format, err = vorbis.Decode(f)
+			bgm.format = "ogg"
+		} else if HasExtension(bgm.filename, ".mp3") {
+			bgm.streamer, format, err = mp3.Decode(f)
+			bgm.format = "mp3"
+		} else if HasExtension(bgm.filename, ".wav") {
+			bgm.streamer, format, err = wav.Decode(f)
+			bgm.format = "wav"
+		} else if HasExtension(bgm.filename, ".flac") {
+			bgm.streamer, format, err = flac.Decode(f)
+			bgm.format = "flac"
+		} else if HasExtension(bgm.filename, ".mid") || HasExtension(bgm.filename, ".midi") {
+			if sf, sferr := loadSoundFont(sys.cfg.Sound.SoundFont); sferr != nil {
+				err = sferr
+			} else {
+				bgm.streamer, format, err = midi.Decode(f, sf, beep.SampleRate(int(sys.cfg.Sound.SampleRate)))
+				bgm.format = "midi"
+			}
+		} else if HasExtension(bgm.filename, ".xm") || HasExtension(bgm.filename, ".mod") || HasExtension(bgm.filename, ".it") || HasExtension(bgm.filename, ".s3m") {
+			bgm.streamer, format, err = xmpDecode(f)
+			bgm.format = "xmp"
+		} else {
+			err = Error(fmt.Sprintf("unsupported file extension: %v", bgm.filename))
+		}
+
 	}
 	if err != nil {
 		f.Close()
@@ -408,7 +493,7 @@ func (bgm *Bgm) Open(filename string, loop, bgmVolume, bgmLoopStart, bgmLoopEnd,
 		return
 	}
 	lc := 0
-	if loop != 0 {
+	if bgm.loop != 0 {
 		if loopcount >= 0 {
 			lc = Max(0, loopcount-1)
 		} else {
@@ -436,9 +521,15 @@ func (bgm *Bgm) Open(filename string, loop, bgmVolume, bgmLoopStart, bgmLoopEnd,
 	// negative values for loopcount (no forever case)
 	bgm.volctrl = &effects.Volume{Streamer: streamer, Base: 2, Volume: 0, Silent: true}
 	bgm.sampleRate = format.SampleRate
-	dstFreq := beep.SampleRate(float32(sys.cfg.Sound.SampleRate) / bgm.freqmul)
+	rateMul := bgm.freqmul
+	if rateMul == 0 {
+		rateMul = 1
+	} // Pending track may have been paused while loading.
+	dstFreq := beep.SampleRate(float32(sys.cfg.Sound.SampleRate) / rateMul)
 	resampler := beep.Resample(Clamp(sys.cfg.Sound.AudioResampleQuality, 1, 16), bgm.sampleRate, dstFreq, bgm.volctrl)
+	resampler.SetFastPolynomial(os.Getenv("IKEMEN_FRONTIER") == "1")
 	bgm.ctrl = &beep.Ctrl{Streamer: resampler}
+	bgm.ctrl.Paused = sys.nomusic || (sys.paused && sys.cfg.Sound.PauseMasterVolume == 0) || bgm.freqmul == 0 || sys.motifPauseMusic()
 	if sys.paused && sys.pauseVolumeApplied {
 		// A new BGM can start while the game is already paused.
 		bgm.volRestore = bgm.bgmVolume
@@ -450,7 +541,7 @@ func (bgm *Bgm) Open(filename string, loop, bgmVolume, bgmLoopStart, bgmLoopEnd,
 	speaker.Play(bgm.ctrl)
 
 	// Handle the RAM swap in the background (only for looped BGM and only if the user enabled it)
-	if lc != 0 && sys.cfg.Sound.BGMRAMBuffer && bgm.format != "xmp" {
+	if lc != 0 && sys.cfg.Sound.BGMRAMBuffer && bgm.format != "xmp" && !cachedMusic {
 		// go func(ctx context.Context) {
 		// Changing this to SafeGo should be safe because ctx has already been captured above
 		SafeGo(func() {
@@ -599,6 +690,10 @@ func (bgm *Bgm) UpdateVolume() {
 }
 
 func (bgm *Bgm) SetFreqMul(freqmul float32) {
+	if bgm.preparing {
+		bgm.freqmul = freqmul
+		return
+	}
 	if bgm.freqmul != freqmul {
 		if bgm.ctrl != nil {
 			// Special case: freqmul == 0 pauses
@@ -622,6 +717,7 @@ func (bgm *Bgm) SetFreqMul(freqmul float32) {
 // OpenFromStreamer wires an arbitrary Beep streamer (e.g. Reisen-backed audio)
 // into the existing BGM path so the video BGM replaces/uses the same channel.
 func (bgm *Bgm) OpenFromStreamer(stream beep.Streamer, srcSampleRate beep.SampleRate, bgmVolume int) {
+	bgm.preparing = false
 	// Right away, cancel any running goroutines.
 	bgm.mu.Lock()
 	if bgm.cancel != nil {
@@ -658,6 +754,7 @@ func (bgm *Bgm) OpenFromStreamer(stream beep.Streamer, srcSampleRate beep.Sample
 	bgm.volctrl = &effects.Volume{Streamer: stream, Base: 2, Volume: 0, Silent: true}
 	dstFreq := beep.SampleRate(float32(sys.cfg.Sound.SampleRate) / bgm.freqmul)
 	resampler := beep.Resample(Clamp(sys.cfg.Sound.AudioResampleQuality, 1, 16), bgm.sampleRate, dstFreq, bgm.volctrl)
+	resampler.SetFastPolynomial(os.Getenv("IKEMEN_FRONTIER") == "1")
 	bgm.ctrl = &beep.Ctrl{Streamer: resampler}
 	if sys.paused && sys.pauseVolumeApplied {
 		// A video-backed BGM can also be attached while pause is active.
@@ -1026,7 +1123,7 @@ func (s *SoundChannel) Reset() {
 }
 
 func (s *SoundChannel) Play(sound *Sound, group, number, loop int32, freqmul float32, loopStart, loopEnd, startPosition int) {
-	if sound == nil {
+	if nativeAudioDisabled || sound == nil {
 		return
 	}
 
@@ -1049,6 +1146,7 @@ func (s *SoundChannel) Play(sound *Sound, group, number, loop int32, freqmul flo
 	srcRate := s.sound.format.SampleRate
 	dstRate := beep.SampleRate(float32(sys.cfg.Sound.SampleRate) / s.sfx.freqmul)
 	resampler := beep.Resample(Clamp(sys.cfg.Sound.AudioResampleQuality, 1, 16), srcRate, dstRate, s.sfx)
+	resampler.SetFastPolynomial(os.Getenv("IKEMEN_FRONTIER") == "1")
 	s.ctrl = &beep.Ctrl{Streamer: resampler}
 	s.streamer.Seek(startPosition)
 
@@ -1305,7 +1403,7 @@ func (s *SoundChannels) Get(pid int32, ch int32) *SoundChannel {
 }
 
 func (s *SoundChannels) Play(sound *Sound, group, number, volumescale int32, pan float32, loopStart, loopEnd, startPosition int, keepOnMatchEnd ...bool) bool {
-	if sound == nil {
+	if nativeAudioDisabled || sound == nil {
 		return false
 	}
 	c := s.Request(-1, -1, false, 0)

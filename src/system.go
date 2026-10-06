@@ -490,7 +490,15 @@ func (s *System) init(w, h int32) *lua.LState {
 
 	// And the audio.
 	speaker = &SDLSpeaker{}
-	speaker.Init(beep.SampleRate(sys.cfg.Sound.SampleRate), audioOutLen)
+	if nativeAudioFactory != nil {
+		speaker = nativeAudioFactory()
+		if err := speaker.Init(beep.SampleRate(sys.cfg.Sound.SampleRate), audioOutLen); err != nil {
+			panic(err)
+		}
+		nativeAudioShutdown = speaker.Close
+	} else {
+		speaker.Init(beep.SampleRate(sys.cfg.Sound.SampleRate), audioOutLen)
+	}
 	speaker.Play(NewNormalizer(s.soundMixer))
 	l := lua.NewState()
 	l.Options.IncludeGoStackTrace = true
@@ -503,6 +511,9 @@ func (s *System) init(w, h int32) *lua.LState {
 		origExit := osTbl.RawGetString("exit")
 		l.SetField(osTbl, "exit", l.NewFunction(func(l *lua.LState) int {
 			memReportFinal()
+			if nativeAudioShutdown != nil {
+				nativeAudioShutdown()
+			}
 			if fn, ok := origExit.(*lua.LFunction); ok {
 				nargs := l.GetTop() // args passed to our wrapper
 				l.Push(fn)
@@ -841,6 +852,9 @@ func (s *System) eventUpdate() bool {
 		v.Activate = false
 	}
 	s.window.pollEvents()
+	if nativeInputUpdate != nil {
+		nativeInputUpdate()
+	}
 	s.gameEnd = s.window.shouldClose()
 	return !s.gameEnd
 }
@@ -885,6 +899,7 @@ func (s *System) keepAlive() {
 }
 
 func (s *System) await(fps int) bool {
+	perfStallPacing(s.frameSkip)
 	if !s.frameSkip {
 		// Render the finished frame
 		gpuT0 := perfGpuBegin()
@@ -4149,7 +4164,9 @@ func (s *System) runMatch() (reload bool) {
 		perfActionEnd(actionT0)
 
 		// Update motif
+		uiStallStart := perfStallBegin()
 		s.uiAction()
+		perfStallEnd(uiStallStart, "ui-action")
 
 		// Patch: Pause stage videos while game is paused
 		// This is necessary for the time being because videos are paused in the stage's action() and pauses now just skip that entirely
@@ -4246,7 +4263,9 @@ func (s *System) runMatch() (reload bool) {
 		}
 
 		// Cue sprites, then render
+		cueStallStart := perfStallBegin()
 		s.cueDraw()
+		perfStallEnd(cueStallStart, "cue-draw")
 		if !s.frameSkip {
 			renderT0 := perfRenderBegin()
 			s.renderFrame()

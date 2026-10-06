@@ -1070,6 +1070,10 @@ func enqueueSpriteDrawCall(rp RenderParams) {
 // renderSpriteImmediate issues all GL calls for a single sprite immediately.
 // Called either directly (batching off / custom shaders) or from the fallback
 // path when the instanced shader is unavailable.
+type spriteQuadRenderer interface {
+	renderSpriteQuads(mgl.Mat4, RenderParams) bool
+}
+
 func renderSpriteImmediate(rp RenderParams) {
 	// Custom shaders (and their grab passes) must see the deferred sprites
 	// already rendered. Flush the queue first — re-entrancy is guarded.
@@ -1171,7 +1175,9 @@ func renderSpriteImmediate(rp RenderParams) {
 		gfx.SetUniformF("alpha", a)
 		gfx.SetUniformF("gray", gray)
 
-		renderSpriteQuad(modelview, rp, drawQuadsUV)
+		if renderer, ok := gfx.(spriteQuadRenderer); !ok || !renderer.renderSpriteQuads(modelview, rp) {
+			renderSpriteQuad(modelview, rp, drawQuadsUV)
+		}
 	}
 
 	renderWithBlending(renderPass, rp.blendMode, rp.blendAlpha, rp.paltex != nil, &spfx, rp.paltex == nil)

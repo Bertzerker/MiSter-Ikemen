@@ -44,6 +44,10 @@ var StringToButtonLUT map[string]int
 
 var input Input
 
+// Optional OSD-mapped controller source. Physical SDL gamepads remain the default.
+var nativePadState func(int) ([15]byte, [6]float32)
+var nativeInputUpdate func()
+
 func initLUTs() {
 	KeyToStringLUT = map[sdl.Keycode]string{
 		sdl.K_RETURN:       "RETURN",
@@ -271,10 +275,16 @@ func (input *Input) UpdateGamepadMappings(path string) {
 }
 
 func (input *Input) GetMaxJoystickCount() int {
+	if nativePadState != nil {
+		return 4
+	}
 	return len(input.controllers)
 }
 
 func (input *Input) IsJoystickPresent(joy int) bool {
+	if nativePadState != nil {
+		return joy >= 0 && joy < 4
+	}
 	if joy < 0 || joy >= len(input.controllers) {
 		return false
 	}
@@ -285,6 +295,12 @@ func (input *Input) IsJoystickPresent(joy int) bool {
 }
 
 func (input *Input) GetJoystickName(joy int) string {
+	if nativePadState != nil {
+		if joy >= 0 && joy < 4 {
+			return "MiSTer OSD Controller"
+		}
+		return ""
+	}
 	if joy < 0 || joy >= len(input.controllers) {
 		return ""
 	}
@@ -292,6 +308,10 @@ func (input *Input) GetJoystickName(joy int) string {
 }
 
 func (input *Input) GetJoystickAxes(joy int) [6]float32 {
+	if nativePadState != nil {
+		_, axes := nativePadState(joy)
+		return axes
+	}
 	if joy < 0 || joy >= len(input.controllerstate) {
 		return [6]float32{0, 0, 0, 0, 0, 0}
 	}
@@ -300,6 +320,10 @@ func (input *Input) GetJoystickAxes(joy int) [6]float32 {
 }
 
 func (input *Input) GetJoystickButtons(joy int) []byte {
+	if nativePadState != nil {
+		buttons, _ := nativePadState(joy)
+		return buttons[:]
+	}
 	if joy < 0 || joy >= len(input.controllerstate) {
 		return []byte{}
 	}
@@ -311,6 +335,9 @@ func (input *Input) GetJoystickButtons(joy int) []byte {
 }
 
 func (input *Input) GetJoystickPath(joy int) string {
+	if nativePadState != nil {
+		return "MiSTer OSD"
+	}
 	if joy < 0 || joy >= len(input.controllers) {
 		return ""
 	}
@@ -318,6 +345,9 @@ func (input *Input) GetJoystickPath(joy int) string {
 }
 
 func (input *Input) GetJoystickGUID(joy int) string {
+	if nativePadState != nil {
+		return ""
+	}
 	if joy < 0 || joy >= len(input.controllers) {
 		return ""
 	}
@@ -335,6 +365,9 @@ func (input *Input) GetJoystickGUID(joy int) string {
 }
 
 func (input *Input) RumbleController(joy int, lo, hi uint16, ticks uint32) {
+	if nativePadState != nil {
+		return
+	}
 	if joy < 0 || joy >= len(input.controllers) || joy >= len(sys.joystickConfig) {
 		return
 	}

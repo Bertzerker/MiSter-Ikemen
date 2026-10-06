@@ -1,4 +1,24 @@
 
+# MiSter Ikemen
+
+Experimental IKEMEN GO port for ARMv7 on the DE10-Nano, with MiSTer Frontier
+video, controller and audio integration, plus FPGA rendering work.
+
+Start with [the MiSTer port documentation](MISTER_PORT.md) for build and launcher
+instructions, validation results and known limitations. The [FPGA documentation](fpga/README.md)
+describes the core, rendering protocol and MiSTer HDMI/VGA scaling.
+
+Based on [leonkasovan/Ikemen-GO](https://github.com/leonkasovan/Ikemen-GO), initially
+at commit `bf63a10d4b572b1c5f1f49a43121122d9c9b3e9d`. This repository contains the
+IKEMEN port; the separate Paintown prototype is maintained outside this checkout.
+This is development source, not a finished release or a guarantee of 60 FPS for
+all MUGEN games. Game packs and generated build outputs are not included.
+
+The original engine license and notices are retained. Inherited FPGA code has
+its own license in [fpga/LICENSE](fpga/LICENSE).
+
+## Upstream documentation
+
 <p align="center">
   <a href="https://ikemen-engine.github.io/">
     <img src="https://github.com/user-attachments/assets/0dcd7ae1-5c9d-44e1-aa32-9ec4b9ed3952" style="width: 699px; alt="IKEMEN GO Logo"/>

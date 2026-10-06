@@ -75,6 +75,9 @@ var swRowJobPool = sync.Pool{
 // the main goroutine processes one chunk itself. Row chunks are disjoint, so
 // the concurrent framebuffer writes never race.
 func (r *Renderer_SW) runRows(d *swRowDraw, py0, py1 int) {
+	if r.gpuRows(d, py0, py1) {
+		return
+	}
 	rows := py1 - py0 + 1
 	width := d.px1 - d.px0 + 1
 	if rows < 2 || rows*width < swMinParallelPixels {
@@ -262,7 +265,15 @@ func (d *swRowDraw) draw(a0, a1 int) {
 					sy = texH - 1
 				}
 				e := int(texData[sy*texStride+sx]) * 8
-				swBlendAlphaOver((*[4]byte)(dst[i*4:]), int(d.tab[e]), int(d.tab[e+1]), int(d.tab[e+2]), int(d.tab[e+3]))
+				// Palette entries are already premultiplied. Skip masked pixels,
+				// and copy opaque pixels without a per-pixel blend call.
+				sa := int(d.tab[e+3])
+				if sa == 255 {
+					p := (*[4]byte)(dst[i*4:])
+					p[0], p[1], p[2], p[3] = d.tab[e], d.tab[e+1], d.tab[e+2], 255
+				} else if sa != 0 {
+					swBlendAlphaOver((*[4]byte)(dst[i*4:]), int(d.tab[e]), int(d.tab[e+1]), int(d.tab[e+2]), sa)
+				}
 				uFP += du
 				vFP += dv
 			}

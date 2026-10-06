@@ -711,6 +711,8 @@ options.t_itemname = {
 	end,
 	--Renderer (submenu)
 	['renderer'] = function(t, item, cursorPosY, moveTxt)
+		-- Frontier's renderer is selected by the launcher, not desktop APIs.
+		if os.getenv('IKEMEN_FRONTIER') == '1' then return true end
 		if getInput(-1, motif.option_info.menu.add.key, motif.option_info.menu.subtract.key, motif.option_info.menu.done.key) then
 			sndPlay(motif.Snd, motif.option_info.cursor.move.snd[1], motif.option_info.cursor.move.snd[2])
 			for k, v in ipairs(t.submenu[t.items[item].itemname].items) do
@@ -1556,6 +1558,10 @@ options.t_vardisplay = {
 		return options.f_boolDisplay(gameOption('Options.RedLife'))
 	end,
 	['renderer'] = function()
+		if os.getenv('IKEMEN_FRONTIER') == '1' then
+			if os.getenv('IKEMEN_GPU') == '1' then return 'MiSTer FPGA + ARM' end
+			return 'MiSTer ARM'
+		end
 		return gameOption('Video.RenderMode')
 	end,
 	['resolution'] = function()

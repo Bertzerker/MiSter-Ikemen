@@ -58,12 +58,20 @@ func (m *Mixer) Stream(samples [][2]float64) (n int, ok bool) {
 		}
 
 		snMax := 0
+		first := true
 		for si := 0; si < len(m.streamers); si++ {
 			// mix the stream
 			sn, sok := m.streamers[si].Stream(m.tmp[:toStream])
-			for i := range m.tmp[:sn] {
-				samples[i][0] += m.tmp[i][0]
-				samples[i][1] += m.tmp[i][1]
+			if first {
+				// Seed the accumulator with the first voice. This avoids two
+				// floating-point additions per sample, including nested mixers.
+				copy(samples[:sn], m.tmp[:sn])
+				first = false
+			} else {
+				for i := range m.tmp[:sn] {
+					samples[i][0] += m.tmp[i][0]
+					samples[i][1] += m.tmp[i][1]
+				}
 			}
 			if sn > snMax {
 				snMax = sn

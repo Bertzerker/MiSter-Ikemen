@@ -4488,7 +4488,7 @@ func (bf BytecodeFunction) run(c *Char, ret []uint8) (changeState bool) {
 	for _, sc := range bf.ctrls {
 		// Do not check ignorehitpause here. The function call already did it
 		//switch sc.(type) {
-		//case StateBlock:
+		//case *StateBlock:
 		//default:
 		//	if c.hitPause() {
 		//		continue
@@ -4578,7 +4578,28 @@ func newStateBlock() *StateBlock {
 	return &StateBlock{persistent: 1, persistentIndex: -1, ignorehitpause: -2}
 }
 
-func (b StateBlock) Run(c *Char, ps []int32) (changeState bool) {
+// State blocks are immutable after compilation. Only loop execution needs a
+// private copy of the loop counters; ordinary trigger blocks can be shared.
+func (b *StateBlock) Run(c *Char, ps []int32) bool {
+	if b.loopBlock {
+		return b.runLoopCopy(c, ps)
+	}
+	return b.run(c, ps)
+}
+
+//go:noinline
+func (b *StateBlock) runLoopCopy(c *Char, ps []int32) bool {
+	local := *b
+	return local.run(c, ps)
+}
+
+// Freeze a compiler snapshot, preserving the previous interface-value semantics.
+func (b *StateBlock) controllerSnapshot() *StateBlock {
+	local := *b
+	return &local
+}
+
+func (b *StateBlock) run(c *Char, ps []int32) (changeState bool) {
 	c.currentSctrlIndex = b.persistentIndex
 	// For Mugen compatibility, if in hitpause and this SCTRL has the same index
 	// as the SCTRL that triggered a ChangeState during the hitpause
@@ -4665,7 +4686,7 @@ func (b StateBlock) Run(c *Char, ps []int32) (changeState bool) {
 			if !interrupt {
 				for _, sc := range b.ctrls {
 					switch sc.(type) {
-					case StateBlock:
+					case *StateBlock:
 					default:
 						if !b.ctrlsIgnorehitpause && c.hitPause() {
 							continue
@@ -4720,7 +4741,7 @@ func (b StateBlock) Run(c *Char, ps []int32) (changeState bool) {
 		}
 		for _, sc := range b.ctrls {
 			switch sc.(type) {
-			case StateBlock:
+			case *StateBlock:
 			default:
 				if !b.ctrlsIgnorehitpause && c.hitPause() {
 					continue
