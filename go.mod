@@ -7,7 +7,7 @@ replace github.com/gopxl/beep/v2 => ./packages/beep
 require (
 	github.com/Eiton/vulkan v0.0.0-20260815135700-bd01199ad8e7
 	github.com/flopp/go-findfont v0.1.0
-	github.com/go-gl/mathgl v1.0.0
+	github.com/go-gl/mathgl v1.2.0
 	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0
 	github.com/gopxl/beep/v2 v2.1.1
 	github.com/ikemen-engine/ggpo v0.0.0-20260914163559-279d7303151f
@@ -22,7 +22,6 @@ require (
 	golang.org/x/exp v0.0.0-20220609121020-a51bd0440498
 	golang.org/x/image v0.46.0
 	golang.org/x/mobile v0.0.0-20221110043201-43a038452099
-	golang.org/x/sys v0.48.0
 	golang.org/x/text v0.42.0
 	gopkg.in/ini.v1 v1.67.0
 )
