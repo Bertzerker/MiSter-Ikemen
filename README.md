@@ -21,7 +21,7 @@ its own license in [fpga/LICENSE](fpga/LICENSE).
 
 <p align="center">
   <a href="https://ikemen-engine.github.io/">
-    <img src="DOCS/IKEMEN4MiSTer.jpg" style="width: 420px; alt="IKEMEN GO Logo"/>
+    <img src="docs/IKEMEN4MiSTer.jpg" style="width: 420px; alt="IKEMEN GO Logo"/>
   </a>
 </p>
 
